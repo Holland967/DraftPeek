@@ -1,0 +1,272 @@
+# ============================================================
+# DraftPeek Package Release APK（单文件自包含出包工作流）
+# ============================================================
+# 在 Actions 页手动触发，构建 production release APK 并上传为 Artifact：
+#   - 默认只打包 arm64-v8a 原生库；ABI 过滤由本 workflow 内嵌的 Gradle
+#     init script 完成（build script 求值后、AGP 创建变体前覆盖
+#     ndk.abiFilters），不要求仓库侧任何其他改动
+#   - 优先使用仓库 Secrets 中的正式签名；未配置时回退一次性 CI 测试签名
+#   - 可选：把 APK 附到 GitHub Release（默认草稿）
+#
+# 与 release.yml 的分工：本工作流是轻量出包通道，不跑测试/lint/benchmark、
+# 不做 tag 版本一致性校验；正式发版仍走 release.yml（tag 推送触发）。
+#
+# 签名 Secrets（与 release.yml 同名，均可在 Settings > Secrets 配置）：
+#   RELEASE_STORE_FILE_BASE64 / RELEASE_STORE_PASSWORD /
+#   RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD
+# ============================================================
+
+name: Package Release APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      abi:
+        description: '要打包的原生库 ABI 架构'
+        required: true
+        default: 'arm64-v8a'
+        type: choice
+        options:
+          - arm64-v8a
+          - armeabi-v7a
+          - x86_64
+          - x86
+          - all
+      release_tag:
+        description: '可选：填 v 开头的 tag 把 APK 附到 Release（留空仅上传 Artifact）'
+        required: false
+        default: ''
+      draft:
+        description: '附到 Release 时是否为草稿'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: package-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: Package APK (${{ inputs.abi }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-home-cache-cleanup: true
+
+      - name: Cache Gradle wrapper
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-package-${{ runner.os }}-${{ hashFiles('**/*.gradle*', 'gradle/libs.versions.toml', 'gradle.properties') }}
+          restore-keys: |
+            gradle-package-${{ runner.os }}-
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      # 签名解析顺序与 release.yml 一致：Secrets 正式签名优先；
+      # 未配置时按 android.yml release-build job 的先例生成一次性 CI 测试密钥。
+      # 注意：signing.gradle 的 file(storeFilePath) 以 app/ 模块目录为基址，
+      # keystore 必须落在 app/ 下（release.jks / ci-release.jks）。
+      - name: Prepare signing credentials
+        env:
+          RELEASE_STORE_FILE_BASE64: ${{ secrets.RELEASE_STORE_FILE_BASE64 }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "${RELEASE_STORE_FILE_BASE64:-}" ]; then
+            echo "$RELEASE_STORE_FILE_BASE64" | base64 -d > app/release.jks
+            STORE_FILE=release.jks
+            STORE_PASSWORD="$RELEASE_STORE_PASSWORD"
+            KEY_ALIAS="$RELEASE_KEY_ALIAS"
+            KEY_PASSWORD="$RELEASE_KEY_PASSWORD"
+            echo "SIGNING_KIND=release" >> "$GITHUB_ENV"
+            echo "使用仓库 Secrets 中的正式签名密钥。"
+          else
+            keytool -genkeypair \
+              -alias ci-test \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -keystore app/ci-release.jks \
+              -storepass citest123 \
+              -keypass citest123 \
+              -dname "CN=CI Test, OU=Dev, O=DraftPeek, L=CI, ST=CI, C=CN"
+            STORE_FILE=ci-release.jks
+            STORE_PASSWORD=citest123
+            KEY_ALIAS=ci-test
+            KEY_PASSWORD=citest123
+            echo "SIGNING_KIND=ci-test" >> "$GITHUB_ENV"
+            echo "::warning::未配置 RELEASE_STORE_FILE_BASE64，本次使用一次性 CI 测试签名；该 APK 不能覆盖安装官方签名的版本。"
+          fi
+          {
+            echo "ci.build=true"
+            echo "RELEASE_STORE_FILE=${STORE_FILE}"
+            echo "RELEASE_STORE_PASSWORD=${STORE_PASSWORD}"
+            echo "RELEASE_KEY_ALIAS=${KEY_ALIAS}"
+            echo "RELEASE_KEY_PASSWORD=${KEY_PASSWORD}"
+          } > local.properties
+
+      - name: Build release APK
+        env:
+          ABI: ${{ inputs.abi }}
+        run: |
+          set -euo pipefail
+
+          # 自包含 ABI 过滤：将 init script 写入临时目录，在 Gradle 配置期
+          # （build script 求值之后、AGP 创建变体之前）覆盖 ndk.abiFilters。
+          # 机制详见脚本头部注释；不修改仓库内任何文件。
+          INIT_SCRIPT="${RUNNER_TEMP}/abi-filter.init.gradle"
+          cat > "${INIT_SCRIPT}" <<'INIT_EOF'
+          // CI-only ABI override (written by the workflow to a temp path).
+          //
+          // Why: app/build.gradle.kts hard-codes ndk.abiFilters for 4 ABIs, and AGP's
+          // own injection (-Pandroid.injected.build.abi) is ignored when abiFilters is
+          // set by the build author. This init script mutates the DSL *after* the build
+          // script has been evaluated but *before* AGP creates the variants (AGP does
+          // that in its own project.afterEvaluate callback), so the requested ABI list
+          // wins without touching the repository.
+          def requested = (gradle.startParameter.projectProperties['draftpeek.abis'] ?: '')
+              .split(',')
+              .collect { it.trim() }
+              .findAll { it }
+
+          if (!requested.isEmpty()) {
+              gradle.beforeProject { project ->
+                  project.afterEvaluate {
+                      if (!project.plugins.hasPlugin('com.android.application')) {
+                          return
+                      }
+                      try {
+                          def filters = project.extensions.getByName('android')
+                              .defaultConfig.ndk.abiFilters
+                          filters.clear()
+                          filters.addAll(requested)
+                          project.logger.lifecycle("[abi-filter] NDK abiFilters -> ${filters}")
+                      } catch (Exception e) {
+                          project.logger.warn("[abi-filter] failed to override abiFilters: ${e}")
+                      }
+                  }
+              }
+          }
+          INIT_EOF
+
+          if [ "${ABI}" = "all" ]; then
+            ABI_ARGS=""
+            echo "打包全部 ABI（不做过滤）。"
+          else
+            ABI_ARGS="-Pdraftpeek.abis=${ABI}"
+            echo "仅打包 ABI：${ABI}"
+          fi
+
+          ./gradlew :app:assembleProductionRelease \
+            -I "${INIT_SCRIPT}" ${ABI_ARGS} \
+            --no-configuration-cache --stacktrace
+
+      # 出包产物的自证步骤：ABI 集合 + 签名有效性 + SHA-256。
+      # 缺少请求的 ABI 或签名校验失败 → 直接失败；含额外 ABI → 警告并按 multi-abi 命名。
+      - name: Collect & verify APK
+        id: collect
+        env:
+          ABI: ${{ inputs.abi }}
+        run: |
+          set -euo pipefail
+          APK_PATH=$(find app/build/outputs/apk/production/release -name '*.apk' | head -1)
+          [ -n "${APK_PATH}" ] || { echo "::error::未找到 production release APK 产物"; exit 1; }
+
+          ABIS=$(unzip -l "${APK_PATH}" | grep -oE 'lib/[^/]+/' | cut -d/ -f2 | sort -u | tr '\n' ',' | sed 's/,$//')
+          echo "APK 内含原生库 ABI：${ABIS:-（无）}"
+
+          if [ "${ABI}" != "all" ]; then
+            case ",${ABIS}," in
+              *",${ABI},"*) ;;
+              *) echo "::error::APK 中缺少请求的 ABI：${ABI}"; exit 1 ;;
+            esac
+            EXTRA=$(echo "${ABIS}" | tr ',' '\n' | grep -vx "${ABI}" | tr '\n' ',' | sed 's/,$//' || true)
+            if [ -n "${EXTRA}" ]; then
+              echo "::warning::APK 中还有额外 ABI：${EXTRA}。ABI 过滤可能未生效，产物已按 multi-abi 命名。"
+            fi
+          fi
+
+          APKSIGNER="${ANDROID_HOME}/build-tools/36.1.0/apksigner"
+          if [ ! -x "${APKSIGNER}" ]; then
+            APKSIGNER=$(find "${ANDROID_HOME}/build-tools" -name apksigner -type f | sort -V | tail -1)
+          fi
+          "${APKSIGNER}" verify --verbose --print-certs "${APK_PATH}"
+
+          # 版本号单一事实来源：gradle.properties（major.minor.patch）
+          VERSION=$(awk -F= '/^draftpeek\.version\.(major|minor|patch)=/{print $2}' gradle.properties | tr -d ' \r' | paste -sd. -)
+          ABI_COUNT=$(echo "${ABIS}" | tr ',' '\n' | grep -c . || true)
+          if [ "${ABI_COUNT}" -gt 1 ]; then
+            ABI_TAG="multi-abi"
+          else
+            ABI_TAG="${ABIS:-universal}"
+          fi
+
+          mkdir -p dist
+          OUT="dist/DraftPeek-v${VERSION}-${ABI_TAG}-release.apk"
+          cp "${APK_PATH}" "${OUT}"
+          (cd dist && sha256sum "$(basename "${OUT}")" > "$(basename "${OUT}").sha256")
+          SHA256=$(sha256sum "${OUT}" | awk '{print $1}')
+
+          {
+            echo "### DraftPeek v${VERSION} (${ABI_TAG})"
+            echo ""
+            echo "- 原生库 ABI：${ABIS:-未知}"
+            echo "- 签名类型：${SIGNING_KIND:-unknown}"
+            echo "- SHA-256：\`${SHA256}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          {
+            echo "apk_path=${OUT}"
+            echo "version=${VERSION}"
+            echo "abi_tag=${ABI_TAG}"
+            echo "sha256=${SHA256}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DraftPeek-${{ steps.collect.outputs.version }}-${{ steps.collect.outputs.abi_tag }}-release
+          path: dist/*
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release (optional)
+        if: inputs.release_tag != ''
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: DraftPeek ${{ inputs.release_tag }}
+          draft: ${{ inputs.draft }}
+          files: dist/*
+          body: |
+            ## DraftPeek ${{ inputs.release_tag }}
+
+            - APK：`${{ steps.collect.outputs.apk_path }}`
+            - SHA-256：`${{ steps.collect.outputs.sha256 }}`
+
+            由「Package Release APK」工作流构建（ABI：${{ inputs.abi }}）。
